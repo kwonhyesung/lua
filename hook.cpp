@@ -5,9 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <cassert>
 
-struct Rule { std::string name, find, replace; };
+struct Rule { std::string name, find, replace; bool whole = false; };   // whole: name 정확일치 → replace(파일 내용)로 청크 전체 교체
 struct Config { bool dump = true; bool log = true; std::vector<Rule> rules; };
 
 Config parse_rules(const std::string& text);
@@ -15,6 +16,7 @@ size_t replace_all(std::string& s, const std::string& find, const std::string& r
 std::string sanitize(const char* chunkname);
 std::vector<int> parse_sig(const char* sig);
 std::vector<size_t> find_sig(const unsigned char* hay, size_t n, const std::vector<int>& pat);
+uint32_t fnv1a(const std::string& s);
 
 static std::string unescape(const std::string& in) {
     std::string out;
@@ -47,6 +49,11 @@ Config parse_rules(const std::string& text) {
             else if (k == "log") c.log = v == "1";
             continue;
         }
+        if (p1 + 1 < line.size() && line[p1 + 1] == '@' && line.find('|', p1 + 1) == std::string::npos) {  // 이름|@파일
+            Rule r; r.name = line.substr(0, p1); r.replace = line.substr(p1 + 2); r.whole = true;
+            c.rules.push_back(r);
+            continue;
+        }
         size_t p2 = line.find('|', p1 + 1);
         if (p2 == std::string::npos || line.find('|', p2 + 1) != std::string::npos) continue;  // | 정확히 2개
         c.rules.push_back({line.substr(0, p1), unescape(line.substr(p1 + 1, p2 - p1 - 1)), unescape(line.substr(p2 + 1))});
@@ -63,6 +70,12 @@ size_t replace_all(std::string& s, const std::string& find, const std::string& r
         ++n;
     }
     return n;
+}
+
+uint32_t fnv1a(const std::string& s) {
+    uint32_t h = 0x811C9DC5u;
+    for (unsigned char c : s) { h ^= c; h *= 0x01000193u; }
+    return h;
 }
 
 std::string sanitize(const char* chunkname) {
@@ -131,6 +144,16 @@ int main() {
     assert(h.size() == 2 && h[0] == 1 && h[1] == 5);
     assert(find_sig(hay, 3, p).empty());
 
+    // whole-replace 규칙
+    Config w = parse_rules("Foo.Bar|@my.lua\nBaz|x|y\n");
+    assert(w.rules.size() == 2);
+    assert(w.rules[0].whole && w.rules[0].name == "Foo.Bar" && w.rules[0].replace == "my.lua" && w.rules[0].find.empty());
+    assert(!w.rules[1].whole);
+    // fnv1a
+    assert(fnv1a("") == 0x811C9DC5u);
+    assert(fnv1a("a") == 0xE40C292Cu);
+    assert(fnv1a("a") != fnv1a("b"));
+
     puts("SELFTEST OK");
     return 0;
 }
@@ -140,6 +163,7 @@ int main() {
 #include <mutex>
 #include <fstream>
 #include <cstdarg>
+#include <unordered_map>
 #include "MinHook.h"
 
 // Task 1 (tools/find_sig.py) 의 SIG: 줄 (luaL_loadbufferx). 스펙 10절 참고.
@@ -171,35 +195,57 @@ static std::wstring widen(const std::string& s) {
     return w;
 }
 
-static void dump_chunk(const std::string& chunk, const std::string& fname) {
+static std::unordered_map<std::string, uint32_t> g_dumped;  // fname -> 내용 해시 (g_mu로 보호)
+
+// 같은 이름·같은 내용이면 다시 쓰지 않고, 같은 이름·다른 내용이면 <name>_<hash>.ext 로 저장한다.
+static void dump_chunk(const std::string& chunk, std::string fname, const char* ext) {
+    uint32_t h = fnv1a(chunk);
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        auto it = g_dumped.find(fname);
+        if (it != g_dumped.end()) {
+            if (it->second == h) return;                       // 이미 저장한 동일 내용
+            char suf[16]; snprintf(suf, sizeof suf, "_%08X", h);
+            fname += suf;
+            if (g_dumped.count(fname)) return;
+        }
+        g_dumped[fname] = h;
+    }
     std::wstring dir = g_base + L"\\dump";
     CreateDirectoryW(dir.c_str(), nullptr);
-    std::ofstream f(dir + L"\\" + widen(fname) + L".lua", std::ios::binary);
+    std::ofstream f(dir + L"\\" + widen(fname) + widen(ext), std::ios::binary);
     if (!f) { logf("ERROR dump open failed %s", fname.c_str()); return; }
     f.write(chunk.data(), (std::streamsize)chunk.size());
-    if (g_cfg.log) logf("DUMP dump/%s.lua", fname.c_str());
+    if (g_cfg.log) logf("DUMP dump/%s%s", fname.c_str(), ext);
 }
 
-// 수집된 청크에 로그/덤프/치환을 적용한다. chunk는 제자리 수정.
-static void process(std::string& chunk, const char* name) {
-    if (!chunk.empty() && chunk[0] == '\x1b') { logf("BYTECODE skip name=%s", name ? name : "(null)"); return; }
-    if (g_cfg.log) logf("LOAD name=%s size=%zu", name ? name : "(null)", chunk.size());
-    if (g_cfg.dump) dump_chunk(chunk, sanitize(name));
-    std::string nm = name ? name : "";
+// 청크에 로그/덤프/치환을 적용한다. chunk는 제자리 수정. 반환값: 청크 전체가 교체되었는가.
+static bool process(std::string& chunk, const char* name) {
+    bool bytecode = !chunk.empty() && chunk[0] == '\x1b';
+    std::string nm = name ? name : "(null)";
+    if (g_cfg.log) logf("%s name=%s size=%zu", bytecode ? "BYTECODE" : "LOAD", nm.c_str(), chunk.size());
+    if (g_cfg.dump) dump_chunk(chunk, sanitize(name), bytecode ? ".luac" : ".lua");
     for (size_t i = 0; i < g_cfg.rules.size(); ++i) {
         const Rule& r = g_cfg.rules[i];
-        if (nm.find(r.name) == std::string::npos) continue;
+        if (r.whole) {
+            if (nm != r.name) continue;
+            chunk = r.replace;
+            logf("REPLACED rule=%zu whole size=%zu", i + 1, chunk.size());
+            return true;                                       // 통째 교체 뒤 문자열 규칙은 의미 없음
+        }
+        if (bytecode || nm.find(r.name) == std::string::npos) continue;
         size_t n = replace_all(chunk, r.find, r.replace);
         if (n) logf("REPLACED rule=%zu n=%zu", i + 1, n);
         else if (g_cfg.log) logf("RULE_MISS rule=%zu", i + 1);
     }
+    return false;
 }
 
 static int hooked_loadbufferx(lua_State* L, const char* buff, size_t sz, const char* name, const char* mode) {
     try {
         std::string chunk(buff ? buff : "", buff ? sz : 0);
-        process(chunk, name);
-        int rc = g_orig(L, chunk.data(), chunk.size(), name, mode);
+        bool whole = process(chunk, name);
+        int rc = g_orig(L, chunk.data(), chunk.size(), name, whole ? nullptr : mode);
         if (g_cfg.log || rc) logf("RESULT rc=%d name=%s", rc, name ? name : "(null)");
         return rc;
     } catch (...) {
@@ -223,6 +269,15 @@ static DWORD WINAPI worker(LPVOID) {
     logf("=== attached pid=%lu ===", GetCurrentProcessId());
 
     g_cfg = parse_rules(read_file(g_base + L"\\rules.txt"));
+    for (size_t i = 0; i < g_cfg.rules.size(); ++i) {           // 이름|@파일 규칙: 파일 내용을 미리 읽어둔다
+        Rule& r = g_cfg.rules[i];
+        if (!r.whole) continue;
+        std::wstring p = widen(r.replace);
+        if (p.size() < 2 || p[1] != L':') p = g_base + L"\\" + p;   // 상대경로는 hook.dll 폴더 기준
+        std::string body = read_file(p);
+        if (body.empty()) logf("ERROR rule=%zu file empty or missing: %s", i + 1, r.replace.c_str());
+        r.replace = body;
+    }
     logf("rules: %zu, dump=%d, log=%d", g_cfg.rules.size(), g_cfg.dump, g_cfg.log);
 
     HMODULE x;

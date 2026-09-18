@@ -1,7 +1,9 @@
 # luahook 규칙 파일. hook.dll과 같은 폴더에 둔다. 주입 시 1회 읽음.
-# 옵션:  dump=1  → 로드되는 모든 스크립트 원문을 dump\ 에 저장 (처음엔 켜두고 뭘 바꿀지 본다)
-#        log=1   → LOAD/DUMP/RESULT 줄 기록 (0이면 REPLACED/ERROR만)
-# 규칙:  청크이름포함문자열|찾을문자열|바꿀문자열   (\n \t \\ 이스케이프 지원)
+# 옵션:  dump=1  → 로드되는 모든 청크를 dump\ 에 저장 (평문 .lua / 바이트코드 .luac). 같은 이름·다른 내용은 이름_해시 로 따로 저장
+#        log=1   → LOAD/BYTECODE/DUMP/RESULT 줄 기록 (0이면 REPLACED/ERROR만)
+# 규칙 1) 청크이름포함문자열|찾을문자열|바꿀문자열   평문 청크에만. \n \t \\ 이스케이프 지원
+# 규칙 2) 청크이름(정확히)|@파일경로              청크 전체를 그 파일(평문 Lua)로 교체. 바이트코드 청크도 가능.
+#          상대경로는 이 폴더 기준. 예) MeramNeighborInfo.OnEnterMap|@my\OnEnterMap.lua
 dump=1
 log=1
 # 예) main.lua|local debug = false|local debug = true
