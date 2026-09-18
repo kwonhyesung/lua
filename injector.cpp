@@ -29,7 +29,11 @@ int wmain(int argc, wchar_t** argv) {
 
     const wchar_t* exe = argc > 1 ? argv[1] : L"msw.exe";
     std::wstring dll;
-    if (argc > 2) dll = argv[2];
+    if (argc > 2) {
+        dll = argv[2];
+        wchar_t buf[MAX_PATH];
+        if (GetFullPathNameW(dll.c_str(), MAX_PATH, buf, nullptr)) dll = buf;
+    }
     else {
         wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
         dll = p; dll.erase(dll.find_last_of(L"\\/") + 1); dll += L"hook.dll";

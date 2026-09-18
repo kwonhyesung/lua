@@ -16,5 +16,5 @@ rem overwriting one's object before link. Build minhook's objects into their own
 cl /nologo /utf-8 /O2 /c minhook\src\*.c minhook\src\hde\*.c /I minhook\include /Foout\mh\ || exit /b 1
 cl /nologo /utf-8 /O2 /EHsc /std:c++17 /LD hook.cpp out\mh\*.obj /I minhook\include /Fe:out\hook.dll /Foout\ || exit /b 1
 cl /nologo /utf-8 /O2 /EHsc /std:c++17 injector.cpp /Fe:out\injector.exe /Foout\ || exit /b 1
-copy /Y rules.txt out\ >nul
+if not exist out\rules.txt copy rules.txt out\ >nul
 echo BUILD OK

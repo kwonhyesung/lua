@@ -1,4 +1,4 @@
-// hook.cpp — xlua.dll의 lua_load를 후킹해 Lua 청크를 치환한다.
+// hook.cpp — xlua.dll의 luaL_loadbufferx를 후킹해 Lua 청크를 로그/덤프/치환한다.
 // /DSELFTEST 로 빌드하면 순수 로직만 콘솔 테스트한다.
 #include <string>
 #include <vector>
@@ -260,13 +260,14 @@ static std::string read_file(const std::wstring& path) {
 }
 
 static DWORD WINAPI worker(LPVOID) {
+  try {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(g_self, path, MAX_PATH);
     g_base = path;
     size_t slash = g_base.find_last_of(L"\\/");
     if (slash != std::wstring::npos) g_base.erase(slash);
     g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"a");
-    logf("=== attached pid=%lu ===", GetCurrentProcessId());
+    logf("=== attached pid=%lu === base=%ls", GetCurrentProcessId(), g_base.c_str());
 
     g_cfg = parse_rules(read_file(g_base + L"\\rules.txt"));
     for (size_t i = 0; i < g_cfg.rules.size(); ++i) {           // 이름|@파일 규칙: 파일 내용을 미리 읽어둔다
@@ -304,6 +305,10 @@ static DWORD WINAPI worker(LPVOID) {
     if (st != MH_OK) { logf("MH_EnableHook failed %d", st); return 0; }
     logf("hook ready");
     return 0;
+  } catch (...) {
+    logf("ERROR worker exception");
+    return 0;
+  }
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {

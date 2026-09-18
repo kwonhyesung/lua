@@ -1,5 +1,6 @@
-# tools/find_sig.py — xlua.dll에서 lua_load 위치를 찾아 바이트 시그니처를 출력한다.
-# 사슬: "attempt to load a" 문자열 → f_parser → (lea 참조) luaD_protectedparser → (call 참조) lua_load
+# tools/find_sig.py — xlua.dll에서 luaL_loadbufferx 위치를 찾아 바이트 시그니처를 출력한다.
+# lua_load는 인라인되어 별도로 존재하지 않는다. luaD_protectedparser는 대체(ALT) 대상.
+# 사슬: "attempt to load a" 문자열 → f_parser → (lea 참조) luaD_protectedparser → (call 참조) luaL_loadbufferx
 import struct, sys
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
