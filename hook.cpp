@@ -134,4 +134,123 @@ int main() {
     puts("SELFTEST OK");
     return 0;
 }
+#else  // ===================== DLL =====================
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <mutex>
+#include <fstream>
+#include <cstdarg>
+#include "MinHook.h"
+
+// Task 1 (tools/find_sig.py) 의 SIG: 줄 (luaL_loadbufferx). 스펙 10절 참고.
+static const char* LOADBUFFERX_SIG = "4C 8B DC 53 48 83 EC 60 4D 89 43 C0 48 8D 05 ?? ?? ?? ?? 49 89 43 D8 4C 8D 05 ?? ?? ?? ?? 49 8D 43 B8";
+
+typedef void lua_State;
+typedef int (*loadbufferx_t)(lua_State*, const char* buff, size_t sz, const char* name, const char* mode);
+
+static HMODULE        g_self;
+static loadbufferx_t  g_orig;
+static Config         g_cfg;
+static std::wstring   g_base;   // hook.dll 폴더
+static std::mutex     g_mu;     // ponytail: 로그·덤프 전역 락 하나
+static FILE*          g_log;
+
+static void logf(const char* fmt, ...) {
+    if (!g_log) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    SYSTEMTIME t; GetLocalTime(&t);
+    fprintf(g_log, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
+    fputc('\n', g_log); fflush(g_log);
+}
+
+static std::wstring widen(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n ? n - 1 : 0, L'\0');
+    if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+
+static void dump_chunk(const std::string& chunk, const std::string& fname) {
+    std::wstring dir = g_base + L"\\dump";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::ofstream f(dir + L"\\" + widen(fname) + L".lua", std::ios::binary);
+    f.write(chunk.data(), (std::streamsize)chunk.size());
+    logf("DUMP dump/%s.lua", fname.c_str());
+}
+
+// 수집된 청크에 로그/덤프/치환을 적용한다. chunk는 제자리 수정.
+static void process(std::string& chunk, const char* name) {
+    if (!chunk.empty() && chunk[0] == '\x1b') { logf("BYTECODE skip name=%s", name ? name : "(null)"); return; }
+    if (g_cfg.log) logf("LOAD name=%s size=%zu", name ? name : "(null)", chunk.size());
+    if (g_cfg.dump) dump_chunk(chunk, sanitize(name));
+    std::string nm = name ? name : "";
+    for (size_t i = 0; i < g_cfg.rules.size(); ++i) {
+        const Rule& r = g_cfg.rules[i];
+        if (nm.find(r.name) == std::string::npos) continue;
+        size_t n = replace_all(chunk, r.find, r.replace);
+        if (n) logf("REPLACED rule=%zu n=%zu", i + 1, n);
+        else if (g_cfg.log) logf("RULE_MISS rule=%zu", i + 1);
+    }
+}
+
+static int hooked_loadbufferx(lua_State* L, const char* buff, size_t sz, const char* name, const char* mode) {
+    std::string chunk(buff ? buff : "", buff ? sz : 0);
+    try { process(chunk, name); }
+    catch (...) { logf("ERROR exception in process name=%s", name ? name : "(null)"); }
+    int rc = g_orig(L, chunk.data(), chunk.size(), name, mode);
+    if (g_cfg.log || rc) logf("RESULT rc=%d name=%s", rc, name ? name : "(null)");
+    return rc;
+}
+
+static std::string read_file(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static DWORD WINAPI worker(LPVOID) {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(g_self, path, MAX_PATH);
+    g_base = path; g_base.erase(g_base.find_last_of(L"\\/"));
+    g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"a");
+    logf("=== attached pid=%lu ===", GetCurrentProcessId());
+
+    g_cfg = parse_rules(read_file(g_base + L"\\rules.txt"));
+    logf("rules: %zu, dump=%d, log=%d", g_cfg.rules.size(), g_cfg.dump, g_cfg.log);
+
+    HMODULE x;
+    while (!(x = GetModuleHandleW(L"xlua.dll"))) Sleep(100);
+
+    auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)x + ((IMAGE_DOS_HEADER*)x)->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    BYTE* text = nullptr; DWORD tsize = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+        if (memcmp(sec->Name, ".text", 5) == 0) { text = (BYTE*)x + sec->VirtualAddress; tsize = sec->Misc.VirtualSize; break; }
+    if (!text) { logf("SIG_FAIL no .text"); return 0; }
+    logf("xlua.dll found at %p text=%p+0x%lX", x, text, tsize);
+
+    std::vector<size_t> hits = find_sig(text, tsize, parse_sig(LOADBUFFERX_SIG));
+    if (hits.size() != 1) { logf("SIG_FAIL count=%zu", hits.size()); return 0; }
+    void* target = text + hits[0];
+    logf("luaL_loadbufferx @ %p (sig match 1)", target);
+
+    MH_STATUS st = MH_Initialize();
+    if (st != MH_OK) { logf("MH_Initialize failed %d", st); return 0; }
+    st = MH_CreateHook(target, (void*)hooked_loadbufferx, (void**)&g_orig);
+    if (st != MH_OK) { logf("MH_CreateHook failed %d", st); return 0; }
+    st = MH_EnableHook(target);
+    if (st != MH_OK) { logf("MH_EnableHook failed %d", st); return 0; }
+    logf("hook ready");
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_self = h;
+        DisableThreadLibraryCalls(h);
+        CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    }
+    return TRUE;
+}
 #endif

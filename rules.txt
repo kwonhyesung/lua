@@ -1,0 +1,7 @@
+# luahook 규칙 파일. hook.dll과 같은 폴더에 둔다. 주입 시 1회 읽음.
+# 옵션:  dump=1  → 로드되는 모든 스크립트 원문을 dump\ 에 저장 (처음엔 켜두고 뭘 바꿀지 본다)
+#        log=1   → LOAD/DUMP/RESULT 줄 기록 (0이면 REPLACED/ERROR만)
+# 규칙:  청크이름포함문자열|찾을문자열|바꿀문자열   (\n \t \\ 이스케이프 지원)
+dump=1
+log=1
+# 예) main.lua|local debug = false|local debug = true
