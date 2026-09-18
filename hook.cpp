@@ -135,7 +135,6 @@ int main() {
     return 0;
 }
 #else  // ===================== DLL =====================
-#define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mutex>
@@ -176,8 +175,9 @@ static void dump_chunk(const std::string& chunk, const std::string& fname) {
     std::wstring dir = g_base + L"\\dump";
     CreateDirectoryW(dir.c_str(), nullptr);
     std::ofstream f(dir + L"\\" + widen(fname) + L".lua", std::ios::binary);
+    if (!f) { logf("ERROR dump open failed %s", fname.c_str()); return; }
     f.write(chunk.data(), (std::streamsize)chunk.size());
-    logf("DUMP dump/%s.lua", fname.c_str());
+    if (g_cfg.log) logf("DUMP dump/%s.lua", fname.c_str());
 }
 
 // 수집된 청크에 로그/덤프/치환을 적용한다. chunk는 제자리 수정.
@@ -196,12 +196,16 @@ static void process(std::string& chunk, const char* name) {
 }
 
 static int hooked_loadbufferx(lua_State* L, const char* buff, size_t sz, const char* name, const char* mode) {
-    std::string chunk(buff ? buff : "", buff ? sz : 0);
-    try { process(chunk, name); }
-    catch (...) { logf("ERROR exception in process name=%s", name ? name : "(null)"); }
-    int rc = g_orig(L, chunk.data(), chunk.size(), name, mode);
-    if (g_cfg.log || rc) logf("RESULT rc=%d name=%s", rc, name ? name : "(null)");
-    return rc;
+    try {
+        std::string chunk(buff ? buff : "", buff ? sz : 0);
+        process(chunk, name);
+        int rc = g_orig(L, chunk.data(), chunk.size(), name, mode);
+        if (g_cfg.log || rc) logf("RESULT rc=%d name=%s", rc, name ? name : "(null)");
+        return rc;
+    } catch (...) {
+        logf("ERROR exception in process name=%s", name ? name : "(null)");
+        return g_orig(L, buff, sz, name, mode);
+    }
 }
 
 static std::string read_file(const std::wstring& path) {
@@ -212,7 +216,9 @@ static std::string read_file(const std::wstring& path) {
 static DWORD WINAPI worker(LPVOID) {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(g_self, path, MAX_PATH);
-    g_base = path; g_base.erase(g_base.find_last_of(L"\\/"));
+    g_base = path;
+    size_t slash = g_base.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) g_base.erase(slash);
     g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"a");
     logf("=== attached pid=%lu ===", GetCurrentProcessId());
 
