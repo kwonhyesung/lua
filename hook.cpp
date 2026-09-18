@@ -199,7 +199,7 @@ static std::unordered_map<std::string, uint32_t> g_dumped;  // fname -> 내용 �
 
 // 같은 이름·같은 내용이면 다시 쓰지 않고, 같은 이름·다른 내용이면 <name>_<hash>.ext 로 저장한다.
 static void dump_chunk(const std::string& chunk, std::string fname, const char* ext) {
-    uint32_t h = fnv1a(chunk);
+    uint32_t h = fnv1a(chunk);  // ponytail: 32-bit FNV, ~0.5% chance one pair collides among 6k chunks; switch to 64-bit if a dump ever goes missing
     {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_dumped.find(fname);
@@ -228,7 +228,7 @@ static bool process(std::string& chunk, const char* name) {
     for (size_t i = 0; i < g_cfg.rules.size(); ++i) {
         const Rule& r = g_cfg.rules[i];
         if (r.whole) {
-            if (nm != r.name) continue;
+            if (nm != r.name || r.replace.empty()) continue;   // 파일 못 읽었으면 원본 유지 (worker가 이미 ERROR 로그)
             chunk = r.replace;
             logf("REPLACED rule=%zu whole size=%zu", i + 1, chunk.size());
             return true;                                       // 통째 교체 뒤 문자열 규칙은 의미 없음
