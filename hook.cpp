@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <cassert>
 
 struct Rule { std::string name, find, replace; };
@@ -78,6 +79,7 @@ std::vector<int> parse_sig(const char* sig) {
     for (const char* p = sig; *p; ) {
         while (*p == ' ') ++p;
         if (!*p) break;
+        if (!p[1]) break;  // truncated token, avoid reading past NUL
         if (p[0] == '?') out.push_back(-1);
         else out.push_back((int)strtol(std::string(p, 2).c_str(), nullptr, 16));
         p += 2;
@@ -122,6 +124,8 @@ int main() {
     // 시그니처
     std::vector<int> p = parse_sig("48 8B ?? 24");
     assert(p.size() == 4 && p[2] == -1 && p[3] == 0x24);
+    assert(parse_sig("48 8").size() == 1);
+    assert(parse_sig("48 ").size() == 1);
     unsigned char hay[] = {0x00, 0x48, 0x8B, 0xFF, 0x24, 0x48, 0x8B, 0x00, 0x24, 0x48};
     std::vector<size_t> h = find_sig(hay, sizeof hay, p);
     assert(h.size() == 2 && h[0] == 1 && h[1] == 5);
