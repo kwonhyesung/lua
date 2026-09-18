@@ -311,11 +311,18 @@ static DWORD WINAPI worker(LPVOID) {
   }
 }
 
-BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = h;
         DisableThreadLibraryCalls(h);
         CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    } else if (reason == DLL_PROCESS_DETACH && g_log) {
+        // 정상 종료(ExitProcess)면 여기가 불리고, 크래시면 안 불린다 → 이 줄의 유무로 튕김/정상종료 구분.
+        // 다른 스레드는 이미 정리된 상태라 뮤텍스를 잡지 않고 바로 쓴다.
+        SYSTEMTIME t; GetLocalTime(&t);
+        fprintf(g_log, "[%02d:%02d:%02d.%03d] === process exit (%s) ===\n",
+                t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, reserved ? "terminating" : "dll unloaded");
+        fflush(g_log);
     }
     return TRUE;
 }
