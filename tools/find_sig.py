@@ -82,7 +82,8 @@ print(f"protectedparser RVA {P:#x}")
 # 4. 그것을 call하는 함수들. 이 빌드에선 lua_load가 호출자 대부분에 인라인돼 있어 한 곳이 아니다:
 #    - '?' 문자열을 참조하는 함수 = lua_load 본체(독립 복사본 또는 lua_load가 인라인된 luaL_loadbufferx)
 #    - 그 외 = lua_load가 인라인된 큰 함수(luaL_loadfilex, db_debug 등)
-#    따라서 후킹 지점은 모든 경로가 반드시 지나는 luaD_protectedparser(L, ZIO*, name, mode) 자체로 한다.
+#    후킹 대상 = luaL_loadbufferx(L, buff, sz, name, mode): lua_load형이면서 export들이 호출하는 함수.
+#    (게임은 C#에서 xluaL_loadbuffer로 바이트를 넘기므로 이 경로가 주 경로. 전체 커버는 ALT_SIG = luaD_protectedparser)
 md = Cs(CS_ARCH_X86, CS_MODE_64); md.detail = True
 exports = {e.address: e.name.decode() for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name}
 
@@ -108,12 +109,19 @@ for c in callers:
     print(f"  {cb:#x} size={ce-cb:<4} callers={n_callers} (exports={n_exp}) {kind}")
     # lua_load 인라인 + getS 리더(luaL_loadbufferx): 호출자 중 export가 있는 lua_load형 함수
     if q and n_exp:
+        assert loadbufferx is None, f"two export-called lua_load-shaped callers: {loadbufferx:#x}, {cb:#x}"
         loadbufferx = cb
-assert len(callers) >= 1
+assert loadbufferx, "no export-called lua_load-shaped caller of protectedparser"
+print(f"loadbufferx   RVA {loadbufferx:#x}")
 
-# 5. 검증: P는 f_parser를 lea로 넘긴다(2·3단계에서 이미 확인) + 호출자 중 lua_load형 함수가 최소 하나
-assert any(refs_q(*func_of(c)) for c in callers), "sanity failed: no lua_load-shaped caller of protectedparser"
-print("sanity        OK (lua_load-shaped caller with '?' reference found)")
+# 5. 검증: 5인자 형태 — 5번째 인자(mode)를 스택 홈([rsp+disp], disp>=0x28)에서 r9로 읽어 P에 넘겨야 한다
+Lb, Le = func_of(loadbufferx)
+mode_from_stack = any(
+    ins.mnemonic == "mov" and ins.op_str.startswith("r9, qword ptr [rsp + ")
+    and ins.operands[1].mem.disp >= 0x28
+    for ins in md.disasm(bytes(img[Lb:Le]), Lb))
+assert mode_from_stack, "sanity failed: loadbufferx does not read a 5th stack arg into r9"
+print("sanity        OK ('?' substitution + 5th arg read from stack into r9)")
 
 # 6. 시그니처: 앞 SIG_LEN 바이트, RIP상대/큰 imm/call·jmp 목표는 ??
 def signature(Lb):
@@ -147,7 +155,9 @@ def unique_sig(Lb, label):
     assert m == [Lb], f"{label} signature not unique: {[hex(x) for x in m]}"
     return " ".join(sig)
 
-print(f"SIG: {unique_sig(P, 'protectedparser')}")
-print("unique        OK  (target: luaD_protectedparser)")
-if loadbufferx:
-    print(f"ALT_SIG (luaL_loadbufferx {loadbufferx:#x}, lua_load inlined; exports call it): {unique_sig(loadbufferx, 'loadbufferx')}")
+print(f"SIG: {unique_sig(loadbufferx, 'loadbufferx')}")
+print("unique        OK  (target: luaL_loadbufferx)")
+try:
+    print(f"ALT_SIG (luaD_protectedparser {P:#x}, all load paths): {unique_sig(P, 'protectedparser')}")
+except AssertionError as ex:
+    print(f"ALT_SIG unavailable: {ex}")
