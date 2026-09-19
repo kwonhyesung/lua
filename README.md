@@ -12,3 +12,7 @@
 
 ## 주의
 넥슨 약관상 클라이언트 개조는 금지. 본인 학습/본인 월드 범위에서만.
+
+## hook.log의 `=== process exit ===` 줄
+ExitProcess로 끝날 때만 찍힌다. 이 게임은 정리 후 TerminateProcess로 종료하는 것으로 보여 정상 종료에도 안 찍힐 수 있다.
+크래시 여부는 Unity `Player.log`(`%USERPROFILE%\AppData\LocalLow\Nexon\MapleStory Worlds\`) 끝에 `Input System ... Shutdown` + `Memory Statistics`가 있는지로 판단한다.
