@@ -308,9 +308,9 @@ return function(self, delta)
           state.huntPortal = nil
           local monPos = monster.MeramMovementComponent and monster.MeramMovementComponent.Position
           if monPos then
-            local direction = directionTo(myPos, monPos)
+            local facingDir = directionTo(myPos, monPos)
             if dist <= 1 or ATTACK_IS_RANGED then
-              controller:ChangeDirection(direction)  -- 공격 전에 대상 쪽으로 방향부터 맞춘다
+              controller:ChangeDirection(facingDir)  -- 공격 전에 대상 쪽으로 방향부터 맞춘다
               local spellInv = getSpellInventory(gameHud)
               local monCC = monster.MeramCreatureController
               if spellInv and monCC and monCC.NetObjId then
@@ -318,7 +318,10 @@ return function(self, delta)
               end
             end
             if dist > 1 then
-              moveToward(myMov, myPos, controller, direction)  -- 원거리라도 계속 접근(줍기 등 위해)
+              -- 이동불가 타일을 완벽히 피하도록 BFS로 다음 칸을 정한다(범위 밖/실패 시 기존 방식으로 대체).
+              local path = bfsPath(myMov.MapId, myPos, monPos, PATHFIND_MAX_NODES)
+              local moveDir = (path and path[1]) or facingDir
+              moveToward(myMov, myPos, controller, moveDir)  -- 원거리라도 계속 접근(줍기 등 위해)
             end
           end
           if dbg and gameHud then
