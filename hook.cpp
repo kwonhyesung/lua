@@ -443,11 +443,16 @@ static void disarm_thread(DWORD tid) {
     CloseHandle(h);
 }
 
-// 진짜 원샷: 대상 whole 규칙이 전부 잡히거나(보통 1초 이내) DISCOVERY_WINDOW_MS가 지나면
-// 그 즉시 armed 스레드 전부 disarm하고 스레드 자체가 끝난다. 그 뒤로는 세션 끝까지 DR을
-// 다시 안 건드림 — 커널 안티치트가 볼 수 있는 노출 시간을 최소화한다. DLL은 계속 로드된
-// 채로 남지만(재주입 안 함), VEH는 등록된 채로 둬도 무해하다(더 이상 아무 스레드도 안 걸려있어서
-// 우리 Dr6 체크에 안 걸리고 그냥 통과됨 — 제작자의 "VEH dormant"와 같은 상태).
+// 대상 whole 규칙이 전부 잡히거나(보통 1초 이내) DISCOVERY_WINDOW_MS가 지나면 armed 스레드를 모두
+// disarm한다. disarm_thread의 SuspendThread→SetThreadContext→ResumeThread가, 하필 그 스레드가
+// g_target 명령어를 막 실행하려는 순간(#DB가 이미 래치됐지만 유저모드 전달 전)과 겹치면 예외 전달이
+// 꼬여서 크래시로 이어지는 레이스가 실제로 재현됐다(crashpad dmp: exception=SINGLE_STEP,
+// faulting_addr=g_target). 반대로 VEH+DLL을 세션 내내 살려두면(레이스는 안전하지만) 디버그 레지스터가
+// 계속 켜져 있는 걸 안티치트가 감지해 TerminateProcess로 죽이는 것도 실제로 재현됐다(크래시 다이얼로그도
+// crashpad dmp도 없이 프로세스만 사라짐 — DLL_PROCESS_DETACH도 안 불림, TerminateProcess의 전형적 증상).
+// 그래서 절충: disarm 직후 VEH는 짧은 유예 시간만 더 살려서(레이스로 놓친 스레드의 낙오 히트를 안전망으로
+// 잡고) 그 다음엔 원래 설계대로 VEH 제거+DLL 언로드해서 노출 시간을 최소화한다.
+static constexpr DWORD DISARM_GRACE_MS = 2000;
 static constexpr DWORD DISCOVERY_WINDOW_MS = 90000;   // 로그인/로딩 화면이 10초보다 훨씬 오래 걸려서 늘림
 static DWORD WINAPI watcher(LPVOID) {
     std::unordered_set<DWORD> armed;
@@ -475,12 +480,14 @@ static DWORD WINAPI watcher(LPVOID) {
     logf("dormant: disarmed %zu thread(s)", armed.size());
     {
         std::lock_guard<std::mutex> lk(g_doneMu);
-        logf("SUMMARY chunks=%zu replaced=%zu miss=%zu whole_rules_done=%zu/%zu",
-             g_chunkCount.load(), g_replacedCount.load(), g_missCount.load(), g_doneRules.size(), g_totalWholeRules);
+        logf("SUMMARY chunks=%zu replaced=%zu miss=%zu whole_rules_done=%zu/%zu armed=%zu",
+             g_chunkCount.load(), g_replacedCount.load(), g_missCount.load(), g_doneRules.size(), g_totalWholeRules, armed.size());
         for (size_t i = 0; i < g_cfg.rules.size(); ++i)
             if (g_cfg.rules[i].whole && !g_doneRules.count(i))
                 logf("SUMMARY whole rule=%zu name=%s NEVER FIRED", i + 1, g_cfg.rules[i].name.c_str());
     }
+    // 유예 시간: disarm 레이스로 놓친 스레드가 있어도 이 창 안에서 히트하면 VEH가 안전하게 처리한다.
+    Sleep(DISARM_GRACE_MS);
     if (g_vehHandle) { RemoveVectoredExceptionHandler(g_vehHandle); g_vehHandle = nullptr; }
     logf("self-unloading (single injection this session, no reapply)");
     FreeLibraryAndExitThread(g_self, 0);   // 이 스레드는 여기서 끝남 (반환 안 함)

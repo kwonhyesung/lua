@@ -11,4 +11,7 @@ log=1
 # 인게임 메뉴 버튼 핸들러를 내 디컴파일 파일로 통째 교체 (이 파일만 고치면 반영, 고친 뒤 재주입 필요)
 UIMeramIngameMenu.HandleButtonClickEvent|@D:\dllgo\decompiled_ida_all\UIMeramIngameMenu.HandleButtonClickEvent.lua
 UIMeramIngameMenu.ApplyState|@D:\dllgo\decompiled_ida_all\UIMeramIngameMenu.ApplyState.lua
+# 따라가기: F1로 켜고 끄면 빨탭(Tab-Tab Fixed) 대상 쪽으로 매 프레임 이동
+MeramTargettingService.OnUpdate|@C:\Users\kwon\Desktop\luahook\patches\MeramTargettingService.OnUpdate.lua
+UIMeramMainHud.HandleKeyDownEvent|@C:\Users\kwon\Desktop\luahook\patches\UIMeramMainHud.HandleKeyDownEvent.lua
 # 예) main.lua|local debug = false|local debug = true
