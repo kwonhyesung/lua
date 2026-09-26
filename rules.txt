@@ -6,6 +6,9 @@
 #          이름은 hook.log의 name=값과 정확히 같아야 함 (dump 파일명은 @/= 이 빠져 있어 다름).
 #          상대경로는 이 폴더 기준. 예) MeramNeighborInfo.OnEnterMap|@my\OnEnterMap.lua
 #          whole 규칙은 문자열 규칙보다 위에 두기
-dump=1
+dump=0
 log=1
+# 인게임 메뉴 버튼 핸들러를 내 디컴파일 파일로 통째 교체 (이 파일만 고치면 반영, 고친 뒤 재주입 필요)
+UIMeramIngameMenu.HandleButtonClickEvent|@D:\dllgo\decompiled_ida_all\UIMeramIngameMenu.HandleButtonClickEvent.lua
+UIMeramIngameMenu.ApplyState|@D:\dllgo\decompiled_ida_all\UIMeramIngameMenu.ApplyState.lua
 # 예) main.lua|local debug = false|local debug = true
