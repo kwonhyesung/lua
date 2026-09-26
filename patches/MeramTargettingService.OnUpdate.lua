@@ -8,6 +8,7 @@ local MOVE_INTERVAL = 0.2  -- 1초 5틱
 local KEEP_DISTANCE = 1  -- 대상과 유지할 최소 거리(맨해튼)
 local SEARCH_EXTRA_STEPS = 2  -- 마지막 좌표 도착 후 마지막 방향으로 더 가볼 칸 수
 local MAP_MATCH_GRACE_SEC = 5  -- 맵 전환(포탈) 중 내 MapId 갱신을 기다려주는 유예 시간
+local PATHFIND_MAX_NODES = 10  -- BFS 탐색 범위(칸 수). 벗어나면 기존 방향 추정 방식으로 대체
 local elapsed = 0
 
 -- 자힐(HP/MP) + 따라가기 대상 회복
@@ -131,6 +132,53 @@ end
 
 local function doorStateGetter(pos)
   return ___MOD._MeramDoorStateService:IsDoorClosed(pos, nil)
+end
+
+-- 따라가기용 BFS 경로탐색: 이동불가 타일을 완벽히 피해서 최단경로를 찾는다.
+-- 별도 타일맵 데이터 없이, 이미 쓰는 CanGo(임의 좌표에 대해 "이 방향으로 갈 수 있나" 판정)를
+-- 그대로 간선(edge) 판정 함수로 재사용한다. maxNodes로 탐색 범위를 제한(가벼움 유지, 범위 밖/
+-- 막혀서 못 찾으면 nil 반환 → 호출부가 기존 방식으로 대체).
+local PATH_DIRS = nil  -- 지연 초기화 (___MOD._MeramDirection 준비된 뒤 채움)
+local function bfsPath(mapId, startPos, goalPos, maxNodes)
+  if startPos.x == goalPos.x and startPos.y == goalPos.y then
+    return {}
+  end
+  if not PATH_DIRS then
+    PATH_DIRS = {
+      ___MOD._MeramDirection.NORTH, ___MOD._MeramDirection.EAST,
+      ___MOD._MeramDirection.SOUTH, ___MOD._MeramDirection.WEST,
+    }
+  end
+  local startKey = startPos.x .. "," .. startPos.y
+  local visited = { [startKey] = true }
+  local queue = { { pos = startPos, path = {} } }
+  local head = 1
+  local expanded = 0
+  while head <= #queue and expanded < maxNodes do
+    local node = queue[head]
+    head = head + 1
+    expanded = expanded + 1
+    for _, dir in ___MOD.ipairs(PATH_DIRS) do
+      if ___MOD._MeramTransformUtils:CanGo(mapId, node.pos, dir, doorStateGetter) then
+        local nextPos = ___MOD._MeramDirection:GetNeighborPointVec2(node.pos, dir)
+        local key = nextPos.x .. "," .. nextPos.y
+        if not visited[key] then
+          visited[key] = true
+          if nextPos.x == goalPos.x and nextPos.y == goalPos.y then
+            local path = {}
+            for i, d in ___MOD.ipairs(node.path) do path[i] = d end
+            path[#path + 1] = dir
+            return path
+          end
+          local newPath = {}
+          for i, d in ___MOD.ipairs(node.path) do newPath[i] = d end
+          newPath[#newPath + 1] = dir
+          queue[#queue + 1] = { pos = nextPos, path = newPath }
+        end
+      end
+    end
+  end
+  return nil  -- 범위(maxNodes) 안에서 못 찾음
 end
 
 -- 목표 방향으로 가되 막혀 있으면 좌/우/반대 순으로 갈 수 있는 방향을 찾아 이동한다.
@@ -379,7 +427,7 @@ return function(self, delta)
         end
       end
 
-      local direction, dx, dy = directionTo(myPos, targetPos)
+      local fallbackDir, dx, dy = directionTo(myPos, targetPos)
       if ___MOD.math.abs(dx) + ___MOD.math.abs(dy) <= KEEP_DISTANCE then
         return
       end
@@ -390,6 +438,9 @@ return function(self, delta)
       end
       elapsed = elapsed - MOVE_INTERVAL
 
+      -- 이동불가 타일을 완벽히 피하도록 BFS로 다음 칸을 정한다(범위 밖/실패 시 기존 방식으로 대체).
+      local path = bfsPath(myMov.MapId, myPos, targetPos, PATHFIND_MAX_NODES)
+      local direction = (path and path[1]) or fallbackDir
       local moved = moveToward(myMov, myPos, controller, direction)
       state.lastDir = moved or direction
     else
