@@ -14,4 +14,8 @@ UIMeramIngameMenu.ApplyState|@D:\dllgo\decompiled_ida_all\UIMeramIngameMenu.Appl
 # 따라가기: F1로 켜고 끄면 빨탭(Tab-Tab Fixed) 대상 쪽으로 매 프레임 이동
 MeramTargettingService.OnUpdate|@C:\Users\kwon\Desktop\luahook\patches\MeramTargettingService.OnUpdate.lua
 UIMeramMainHud.HandleKeyDownEvent|@C:\Users\kwon\Desktop\luahook\patches\UIMeramMainHud.HandleKeyDownEvent.lua
+# 자힐 판단용: 내 HP/MP 값이 갱신될 때 ___MOD._G 브리지에 캐싱
+UIMeramUserInfo.SetProp|@C:\Users\kwon\Desktop\luahook\patches\UIMeramUserInfo.SetProp.lua
+# 대상 회복 판단용: 피격당한 대상(따라가기 대상 포함)의 HP를 NetObjId 기준으로 캐싱
+MeramCreatureController.Attacked|@C:\Users\kwon\Desktop\luahook\patches\MeramCreatureController.Attacked.lua
 # 예) main.lua|local debug = false|local debug = true
