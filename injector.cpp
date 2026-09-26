@@ -63,6 +63,23 @@ int wmain(int argc, wchar_t** argv) {
     rnd[8] = 0;
     std::wstring copy = std::wstring(tmpdir) + rnd + L".dll";
     if (!CopyFileW(dll.c_str(), copy.c_str(), FALSE)) { ilog(L"COPY_FAIL err=%lu", GetLastError()); return fail(L"임시 DLL 복사 실패"); }
+
+    // hook.dll은 이 사본(%TEMP%) 경로로 로드되므로 자기 모듈 경로로는 원래 프로젝트 폴더(rules.txt,
+    // out\ 등이 있는 곳)를 알 수 없다. 사본 옆에 "<사본이름>.dir" 파일로 원래 폴더를 적어두면
+    // hook.cpp가 그걸 읽어서 어느 PC/폴더에 있든 항상 실제 프로젝트 폴더를 찾아간다.
+    {
+        std::wstring origDir = dll; origDir.erase(origDir.find_last_of(L"\\/") + 1);
+        if (!origDir.empty() && (origDir.back() == L'\\' || origDir.back() == L'/')) origDir.pop_back();
+        FILE* mf = _wfopen((copy + L".dir").c_str(), L"wb");
+        if (mf) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string narrow(n ? n - 1 : 0, '\0');
+            if (n) WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, &narrow[0], n, nullptr, nullptr);
+            fwrite(narrow.data(), 1, narrow.size(), mf);
+            fclose(mf);
+        }
+    }
+
     dll = copy;   // 게임엔 사본을 주입
     wprintf(L"임시 DLL: %s\n", dll.c_str());
 
@@ -87,13 +104,16 @@ int wmain(int argc, wchar_t** argv) {
     VirtualFreeEx(h, mem, 0, MEM_RELEASE);
     CloseHandle(t);
 
-    if (!rc) { ilog(L"LOADLIBRARY_FAIL exitcode=0"); CloseHandle(h); DeleteFileW(dll.c_str()); return fail(L"대상 안에서 LoadLibrary 실패 (hook.dll 비트/의존성 확인)"); }
+    if (!rc) { ilog(L"LOADLIBRARY_FAIL exitcode=0"); CloseHandle(h); DeleteFileW(dll.c_str()); DeleteFileW((dll + L".dir").c_str()); return fail(L"대상 안에서 LoadLibrary 실패 (hook.dll 비트/의존성 확인)"); }
     ilog(L"INJECT_OK %s", dll.c_str());
     wprintf(L"주입 완료. out\\hook.log를 확인하세요.\n30초 후 이 창은 자동으로 닫힙니다 (훅은 게임 프로세스 안에서 계속 동작).\n");
     // hook.dll은 게임에 로드된 채로 계속 살아있으므로(자가언로드 안 함) 지금은 못 지운다 —
     // 시도만 해보고 실패(파일 사용 중)해도 그냥 넘어간다. 게임 종료 후 %TEMP%에 파일이 남아있어도 무해.
+    // .dir 마커는 worker 스레드가 비동기로 읽으므로 곧바로 지우면 레이스가 생길 수 있어
+    // 30초 대기 뒤(이미 다 읽었을 시점)에 같이 정리한다.
     Sleep(30000);
     CloseHandle(h);
     DeleteFileW(dll.c_str());
+    DeleteFileW((dll + L".dir").c_str());
     return 0;
 }

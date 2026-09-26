@@ -498,9 +498,24 @@ static std::string read_file(const std::wstring& path) {
     return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+// 주입기가 DLL을 %TEMP%에 복사해 넣기 때문에(자기 모듈 경로로는 원래 프로젝트 폴더를 알 수 없음),
+// injector.exe가 사본 옆에 "<사본이름>.dir" 파일로 원래 폴더 경로를 같이 남겨둔다. 그 파일을 읽어서
+// 어느 PC/폴더에 있든 rules/log/dump가 항상 실제 프로젝트 폴더(out\)를 가리키게 한다.
+// 마커 파일이 없으면(예: 수동 LoadLibrary 테스트) 그냥 자기 모듈 폴더로 대체한다.
+static std::wstring resolve_base_dir() {
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(g_self, self, MAX_PATH);
+    std::wstring marker = std::wstring(self) + L".dir";
+    std::string content = read_file(marker);
+    if (!content.empty()) return widen(content);
+    std::wstring dir = self;
+    size_t slash = dir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? dir : dir.substr(0, slash);
+}
+
 static DWORD WINAPI worker(LPVOID) {
   try {
-    g_base = L"C:\\Users\\kwon\\Desktop\\luahook\\out";   // 고정: DLL 사본이 Temp에서 돌아도 rules/log/dump는 항상 여기
+    g_base = resolve_base_dir();
     rotate_log(g_base);   // 이전 hook.log를 타임스탬프 이름으로 보존 (최근 KEEP_LOGS개만)
     g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"w");
     logf("=== attached pid=%lu === base=%ls", GetCurrentProcessId(), g_base.c_str());
