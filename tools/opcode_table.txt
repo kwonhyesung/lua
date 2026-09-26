@@ -1,0 +1,63 @@
+# 이 게임(Meram/il2cpp, Lua 5.3 컨테이너)의 뒤섞인 opcode 표
+# 출처: D:\dllgo\original\REVIEW.md (2026-09-08 분석, 6,339개 청크 교차검증)
+#
+# 표준 Lua 5.3 instruction 레이아웃: op:6 | A:8 | C:9 | B:9 (변경 없음, 번호만 뒤섞임)
+#
+# 아직 안 밝혀진 것 (REVIEW.md에 매핑 없음): SETUPVAL, VARARG, EXTRAARG
+# "중간 확신" 항목은 산술/비트 연산이라 일부 뒤바뀌었을 수 있음(특히 9번 DIV/IDIV 애매).
+# 결과가 이상하면 이 구간(DIV/IDIV/MOD/NOT/BOR/BXOR/SHR/LOADKX/SETLIST) 먼저 의심할 것.
+
+VERSION 53
+OPBITS 6
+ABITS 8
+BBITS 9
+CBITS 9
+HASKFLAG TRUE
+
+# --- 높은 확신 ---
+17  CLOSURE    ABX
+31  RETURN     ABC
+20  JMP        ASBX
+29  CALL       ABC
+41  TAILCALL   ABC
+28  TEST       ABC
+23  TESTSET    ABC
+46  EQ         ABC
+24  LT         ABC
+35  LE         ABC
+10  MOVE       ABC
+15  LOADK      ABX
+11  LOADBOOL   ABC
+4   LOADNIL    ABC
+30  GETTABLE   ABC
+2   GETTABUP   ABC
+34  SELF       ABC
+45  SETTABLE   ABC
+21  SETTABUP   ABC
+19  NEWTABLE   ABC
+25  CONCAT     ABC
+36  LEN        ABC
+6   GETUPVAL   ABC
+40  FORPREP    ASBX
+22  FORLOOP    ASBX
+43  TFORCALL   ABC
+42  TFORLOOP   ASBX
+27  ADD        ABC
+0   SHL        ABC
+47  MUL        ABC
+7   SUB        ABC
+33  UNM        ABC
+12  BAND       ABC
+14  POW        ABC
+
+# --- 중간 확신 (검증 덜 됨) ---
+18  DIV        ABC
+9   DIV        ABC
+44  IDIV       ABC
+37  MOD        ABC
+5   BOR        ABC
+16  NOT        ABC
+3   LOADKX     ABX
+13  SHR        ABC
+26  BXOR       ABC
+32  SETLIST    ABC
