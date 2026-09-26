@@ -166,6 +166,10 @@ int main() {
 #include <cstdarg>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
+#include <filesystem>
+#include <algorithm>
+namespace fs = std::filesystem;
 
 // Task 1 (tools/find_sig.py) 의 SIG: 줄 (luaL_loadbufferx). 스펙 10절 참고.
 static const char* LOADBUFFERX_SIG = "4C 8B DC 53 48 83 EC 60 4D 89 43 C0 48 8D 05 ?? ?? ?? ?? 49 89 43 D8 4C 8D 05 ?? ?? ?? ?? 49 8D 43 B8";
@@ -187,6 +191,29 @@ static std::wstring   g_base;   // hook.dll 폴더
 static std::mutex     g_mu;     // ponytail: 로그·덤프 전역 락 하나
 static FILE*          g_log;
 static void*          g_vehHandle;   // AddVectoredExceptionHandler 반환값 — 언로드 전에 반드시 해제
+
+static std::atomic<size_t> g_chunkCount{0}, g_replacedCount{0}, g_missCount{0};
+
+static constexpr int KEEP_LOGS = 10;   // hook.log 외에 보관할 이전 로그 개수
+// 기존 hook.log를 타임스탬프 이름으로 보존하고, 오래된 보존본은 KEEP_LOGS개만 남기고 지운다.
+static void rotate_log(const std::wstring& base) {
+    fs::path cur = fs::path(base) / L"hook.log";
+    std::error_code ec;
+    if (fs::exists(cur, ec)) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        wchar_t stamp[32];
+        swprintf(stamp, 32, L"hook_%04d%02d%02d_%02d%02d%02d.log", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        fs::rename(cur, fs::path(base) / stamp, ec);
+    }
+    std::vector<fs::path> archived;
+    for (auto& e : fs::directory_iterator(fs::path(base), ec)) {
+        std::wstring name = e.path().filename().wstring();
+        if (name.rfind(L"hook_", 0) == 0 && name.size() > 4 && name.substr(name.size() - 4) == L".log")
+            archived.push_back(e.path());
+    }
+    std::sort(archived.begin(), archived.end());   // 이름에 타임스탬프가 들어있어 사전순 = 시간순
+    while ((int)archived.size() > KEEP_LOGS) { fs::remove(archived.front(), ec); archived.erase(archived.begin()); }
+}
 
 // 진짜 원샷: 대상 whole 규칙이 전부 REPLACED되면(보통 1초 이내) HWBP를 완전히 풀고
 // 그 뒤로는 세션 끝까지 DR 레지스터를 다시 안 건드린다 (커널 안티치트 노출 시간 최소화).
@@ -260,6 +287,7 @@ static void dump_chunk(const std::string& chunk, std::string fname, const char* 
 static bool process(std::string& chunk, const char* name) {
     bool bytecode = !chunk.empty() && chunk[0] == '\x1b';
     std::string nm = name ? name : "(null)";
+    ++g_chunkCount;
     if (g_cfg.log) logf("%s name=%s size=%zu h=%08X", bytecode ? "BYTECODE" : "LOAD", nm.c_str(), chunk.size(), fnv1a(chunk));
     if (g_cfg.dump) dump_chunk(chunk, sanitize(name), bytecode ? ".luac" : ".lua");
     for (size_t i = 0; i < g_cfg.rules.size(); ++i) {
@@ -269,12 +297,13 @@ static bool process(std::string& chunk, const char* name) {
             chunk = r.replace;
             logf("REPLACED rule=%zu whole size=%zu", i + 1, chunk.size());
             mark_rule_done(i);
+            ++g_replacedCount;
             return true;                                       // 통째 교체 뒤 문자열 규칙은 의미 없음
         }
         if (bytecode || nm.find(r.name) == std::string::npos) continue;
         size_t n = replace_all(chunk, r.find, r.replace);
-        if (n) logf("REPLACED rule=%zu n=%zu", i + 1, n);
-        else if (g_cfg.log) logf("RULE_MISS rule=%zu", i + 1);
+        if (n) { logf("REPLACED rule=%zu n=%zu", i + 1, n); ++g_replacedCount; }
+        else { if (g_cfg.log) logf("RULE_MISS rule=%zu", i + 1); ++g_missCount; }
     }
     return false;
 }
@@ -444,6 +473,14 @@ static DWORD WINAPI watcher(LPVOID) {
     }
     for (DWORD tid : armed) disarm_thread(tid);
     logf("dormant: disarmed %zu thread(s)", armed.size());
+    {
+        std::lock_guard<std::mutex> lk(g_doneMu);
+        logf("SUMMARY chunks=%zu replaced=%zu miss=%zu whole_rules_done=%zu/%zu",
+             g_chunkCount.load(), g_replacedCount.load(), g_missCount.load(), g_doneRules.size(), g_totalWholeRules);
+        for (size_t i = 0; i < g_cfg.rules.size(); ++i)
+            if (g_cfg.rules[i].whole && !g_doneRules.count(i))
+                logf("SUMMARY whole rule=%zu name=%s NEVER FIRED", i + 1, g_cfg.rules[i].name.c_str());
+    }
     if (g_vehHandle) { RemoveVectoredExceptionHandler(g_vehHandle); g_vehHandle = nullptr; }
     logf("self-unloading (single injection this session, no reapply)");
     FreeLibraryAndExitThread(g_self, 0);   // 이 스레드는 여기서 끝남 (반환 안 함)
@@ -457,7 +494,8 @@ static std::string read_file(const std::wstring& path) {
 static DWORD WINAPI worker(LPVOID) {
   try {
     g_base = L"C:\\Users\\kwon\\Desktop\\luahook\\out";   // 고정: DLL 사본이 Temp에서 돌아도 rules/log/dump는 항상 여기
-    g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"w");   // 실행마다 새로 씀 (이전 로그 덮어씀)
+    rotate_log(g_base);   // 이전 hook.log를 타임스탬프 이름으로 보존 (최근 KEEP_LOGS개만)
+    g_log = _wfopen((g_base + L"\\hook.log").c_str(), L"w");
     logf("=== attached pid=%lu === base=%ls", GetCurrentProcessId(), g_base.c_str());
 
     g_cfg = parse_rules(read_file(g_base + L"\\rules.txt"));
