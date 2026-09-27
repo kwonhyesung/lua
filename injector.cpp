@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <conio.h>
 #include <cstdarg>
+#pragma comment(lib, "user32.lib")
 
 static DWORD find_pid(const wchar_t* name) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -37,6 +38,62 @@ static void ilog(const wchar_t* fmt, ...) {
     fclose(f);
 }
 
+// hook.dll을 %TEMP%에 랜덤 이름으로 복사하고, 원본 폴더를 적은 .dir 마커를 같이 남긴 뒤
+// pid에 LoadLibraryW 원격 스레드로 주입한다. 실패해도 false만 반환하고 종료하지 않는다
+// (Insert 재주입 루프에서 한 번 실패했다고 프로그램 전체가 죽으면 안 되므로).
+static bool inject_into(DWORD pid, const std::wstring& origDll) {
+    wchar_t tmpdir[MAX_PATH]; GetTempPathW(MAX_PATH, tmpdir);
+    srand((unsigned)(GetTickCount64() ^ GetCurrentProcessId() ^ pid));
+    wchar_t rnd[9];
+    for (int i = 0; i < 8; ++i) rnd[i] = L"0123456789abcdef"[rand() & 0xF];
+    rnd[8] = 0;
+    std::wstring copy = std::wstring(tmpdir) + rnd + L".dll";
+    if (!CopyFileW(origDll.c_str(), copy.c_str(), FALSE)) { ilog(L"COPY_FAIL err=%lu", GetLastError()); wprintf(L"임시 DLL 복사 실패 (오류 %lu)\n", GetLastError()); return false; }
+
+    {
+        std::wstring origDir = origDll; origDir.erase(origDir.find_last_of(L"\\/") + 1);
+        if (!origDir.empty() && (origDir.back() == L'\\' || origDir.back() == L'/')) origDir.pop_back();
+        FILE* mf = _wfopen((copy + L".dir").c_str(), L"wb");
+        if (mf) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string narrow(n ? n - 1 : 0, '\0');
+            if (n) WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, &narrow[0], n, nullptr, nullptr);
+            fwrite(narrow.data(), 1, narrow.size(), mf);
+            fclose(mf);
+        }
+    }
+
+    wprintf(L"임시 DLL: %s\n", copy.c_str());
+
+    HANDLE h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!h) { ilog(L"OPENPROCESS_FAIL err=%lu", GetLastError()); wprintf(L"OpenProcess 실패 (오류 %lu). 관리자 권한으로 실행하세요\n", GetLastError()); return false; }
+
+    SIZE_T bytes = (copy.size() + 1) * sizeof(wchar_t);
+    void* mem = VirtualAllocEx(h, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem || !WriteProcessMemory(h, mem, copy.c_str(), bytes, nullptr)) { ilog(L"VALLOC_OR_WPM_FAIL err=%lu", GetLastError()); wprintf(L"메모리 쓰기 실패\n"); CloseHandle(h); return false; }
+
+    auto loadlib = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+    HANDLE t = CreateRemoteThread(h, nullptr, 0, loadlib, mem, 0, nullptr);
+    if (!t) { ilog(L"CRT_FAIL err=%lu", GetLastError()); wprintf(L"CreateRemoteThread 실패\n"); VirtualFreeEx(h, mem, 0, MEM_RELEASE); CloseHandle(h); return false; }
+    WaitForSingleObject(t, INFINITE);
+    DWORD rc = 0; GetExitCodeThread(t, &rc);
+    VirtualFreeEx(h, mem, 0, MEM_RELEASE);
+    CloseHandle(t);
+    CloseHandle(h);
+
+    if (!rc) {
+        ilog(L"LOADLIBRARY_FAIL exitcode=0");
+        wprintf(L"대상 안에서 LoadLibrary 실패 (hook.dll 비트/의존성 확인)\n");
+        DeleteFileW(copy.c_str()); DeleteFileW((copy + L".dir").c_str());
+        return false;
+    }
+    ilog(L"INJECT_OK %s", copy.c_str());
+    wprintf(L"주입 완료. out\\hook.log를 확인하세요.\n");
+    // hook.dll은 규칙 적용 후 자기 스스로 언로드하므로(hook.cpp의 self-unload) 여기서 굳이
+    // 대기 후 삭제하지 않는다 — %TEMP%에 임시 파일이 남아도 무해하니 그냥 둔다.
+    return true;
+}
+
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
 
@@ -55,65 +112,28 @@ int wmain(int argc, wchar_t** argv) {
     { std::wstring d = dll; d.erase(d.find_last_of(L"\\/") + 1); g_logPath = d + L"injector.log"; }
     ilog(L"=== injector start, dll=%s ===", dll.c_str());
 
-    // hook.dll을 %TEMP%에 8자리 랜덤 이름으로 복사 → 원본은 게임 실행 중에도 재빌드 가능.
-    wchar_t tmpdir[MAX_PATH]; GetTempPathW(MAX_PATH, tmpdir);
-    srand((unsigned)(GetTickCount64() ^ GetCurrentProcessId()));
-    wchar_t rnd[9];
-    for (int i = 0; i < 8; ++i) rnd[i] = L"0123456789abcdef"[rand() & 0xF];
-    rnd[8] = 0;
-    std::wstring copy = std::wstring(tmpdir) + rnd + L".dll";
-    if (!CopyFileW(dll.c_str(), copy.c_str(), FALSE)) { ilog(L"COPY_FAIL err=%lu", GetLastError()); return fail(L"임시 DLL 복사 실패"); }
+    // 채널이동 등으로 게임이 Lua를 재로드하면 이전에 넣은 패치가 날아간다. 그때마다 이 창을
+    // 다시 실행할 필요 없이, Insert 키를 누르면 같은 프로세스에 재주입한다(원본 제작자도 이 방식).
+    wprintf(L"%s 대기 중... (게임을 실행하세요)\n", exe);
+    GetAsyncKeyState(VK_INSERT); // 시작 전에 눌려있던 상태를 흘려보내 첫 루프에서 오탐하지 않게 한다
+    for (;;) {
+        DWORD pid;
+        while (!(pid = find_pid(exe))) Sleep(500);
+        wprintf(L"pid %lu 발견. 2초 후 주입합니다.\n", pid);
+        Sleep(2000);
+        inject_into(pid, dll);
+        wprintf(L"Insert 키: 재주입 (채널이동 등으로 훅이 빠졌을 때 누르세요). 게임 종료 시 자동으로 재대기합니다.\n");
 
-    // hook.dll은 이 사본(%TEMP%) 경로로 로드되므로 자기 모듈 경로로는 원래 프로젝트 폴더(rules.txt,
-    // out\ 등이 있는 곳)를 알 수 없다. 사본 옆에 "<사본이름>.dir" 파일로 원래 폴더를 적어두면
-    // hook.cpp가 그걸 읽어서 어느 PC/폴더에 있든 항상 실제 프로젝트 폴더를 찾아간다.
-    {
-        std::wstring origDir = dll; origDir.erase(origDir.find_last_of(L"\\/") + 1);
-        if (!origDir.empty() && (origDir.back() == L'\\' || origDir.back() == L'/')) origDir.pop_back();
-        FILE* mf = _wfopen((copy + L".dir").c_str(), L"wb");
-        if (mf) {
-            int n = WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, nullptr, 0, nullptr, nullptr);
-            std::string narrow(n ? n - 1 : 0, '\0');
-            if (n) WideCharToMultiByte(CP_UTF8, 0, origDir.c_str(), -1, &narrow[0], n, nullptr, nullptr);
-            fwrite(narrow.data(), 1, narrow.size(), mf);
-            fclose(mf);
+        for (;;) {
+            Sleep(100);
+            if (!find_pid(exe)) { wprintf(L"게임 종료 감지. 재시작을 기다립니다.\n"); break; }
+            if (GetAsyncKeyState(VK_INSERT) & 1) {
+                DWORD curPid = find_pid(exe);
+                if (curPid) {
+                    wprintf(L"Insert 감지 -> 재주입\n");
+                    inject_into(curPid, dll);
+                }
+            }
         }
     }
-
-    dll = copy;   // 게임엔 사본을 주입
-    wprintf(L"임시 DLL: %s\n", dll.c_str());
-
-    wprintf(L"%s 대기 중... (게임을 실행하세요)\n", exe);
-    DWORD pid;
-    while (!(pid = find_pid(exe))) Sleep(500);
-    wprintf(L"pid %lu 발견. 2초 후 주입합니다.\n", pid);
-    Sleep(2000);
-
-    HANDLE h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!h) { ilog(L"OPENPROCESS_FAIL err=%lu", GetLastError()); return fail(L"OpenProcess 실패. 관리자 권한으로 실행하세요"); }
-
-    SIZE_T bytes = (dll.size() + 1) * sizeof(wchar_t);
-    void* mem = VirtualAllocEx(h, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!mem || !WriteProcessMemory(h, mem, dll.c_str(), bytes, nullptr)) { ilog(L"VALLOC_OR_WPM_FAIL err=%lu", GetLastError()); return fail(L"메모리 쓰기 실패"); }
-
-    auto loadlib = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
-    HANDLE t = CreateRemoteThread(h, nullptr, 0, loadlib, mem, 0, nullptr);
-    if (!t) { ilog(L"CRT_FAIL err=%lu", GetLastError()); return fail(L"CreateRemoteThread 실패"); }
-    WaitForSingleObject(t, INFINITE);
-    DWORD rc = 0; GetExitCodeThread(t, &rc);
-    VirtualFreeEx(h, mem, 0, MEM_RELEASE);
-    CloseHandle(t);
-
-    if (!rc) { ilog(L"LOADLIBRARY_FAIL exitcode=0"); CloseHandle(h); DeleteFileW(dll.c_str()); DeleteFileW((dll + L".dir").c_str()); return fail(L"대상 안에서 LoadLibrary 실패 (hook.dll 비트/의존성 확인)"); }
-    ilog(L"INJECT_OK %s", dll.c_str());
-    wprintf(L"주입 완료. out\\hook.log를 확인하세요.\n30초 후 이 창은 자동으로 닫힙니다 (훅은 게임 프로세스 안에서 계속 동작).\n");
-    // hook.dll은 게임에 로드된 채로 계속 살아있으므로(자가언로드 안 함) 지금은 못 지운다 —
-    // 시도만 해보고 실패(파일 사용 중)해도 그냥 넘어간다. 게임 종료 후 %TEMP%에 파일이 남아있어도 무해.
-    // .dir 마커는 worker 스레드가 비동기로 읽으므로 곧바로 지우면 레이스가 생길 수 있어
-    // 30초 대기 뒤(이미 다 읽었을 시점)에 같이 정리한다.
-    Sleep(30000);
-    CloseHandle(h);
-    DeleteFileW(dll.c_str());
-    DeleteFileW((dll + L".dir").c_str());
-    return 0;
 }

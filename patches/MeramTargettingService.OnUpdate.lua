@@ -5,10 +5,10 @@
 -- On/Off 상태는 UIMeramMainHud.HandleKeyDownEvent(F1)와 ___MOD._G.__LuahookFollow로 공유한다
 -- (서로 다른 청크라 self로 상태 공유 불가 → Lua 전역 테이블을 브리지로 사용).
 local MOVE_INTERVAL = 0.2  -- 1초 5틱
-local KEEP_DISTANCE = 1  -- 대상과 유지할 최소 거리(맨해튼)
+local KEEP_DISTANCE = 2  -- 대상과 유지할 최소 거리(맨해튼)
 local SEARCH_EXTRA_STEPS = 2  -- 마지막 좌표 도착 후 마지막 방향으로 더 가볼 칸 수
 local MAP_MATCH_GRACE_SEC = 5  -- 맵 전환(포탈) 중 내 MapId 갱신을 기다려주는 유예 시간
-local PATHFIND_MAX_NODES = 10  -- BFS 탐색 범위(칸 수). 벗어나면 기존 방향 추정 방식으로 대체
+local PATHFIND_MAX_NODES = 200  -- BFS 탐색 범위(칸 수). 벗어나면 기존 방향 추정 방식으로 대체
 local elapsed = 0
 
 -- 자힐(HP/MP) + 따라가기 대상 회복
@@ -26,7 +26,7 @@ local dbgElapsed = 0
 
 -- 공격 스킬(캐릭터마다 다르지만 우선 1번 슬롯으로 고정)
 local ATTACK_SPELL_SLOT = 1
-local ATTACK_IS_RANGED = true  -- 1번 스킬이 원거리면 true(붙지 않아도 바로 시전), 근접이면 false
+local ATTACK_RANGE_DEFAULT = 1  -- -/+ 키로 1~10칸 조절 가능(state.attackRange). 1=근접만, 그 이상=사거리 안이면 바로 시전
 
 -- 자동사냥 (F3): 시야 안(같은 맵)의 가장 가까운 몬스터에게 이동+공격
 local HUNT_INTERVAL = 0.2  -- 1초 5틱
@@ -37,8 +37,28 @@ local noMonsterElapsed = 0
 -- 몬스터가 없을 때 다음 맵으로: 안 가본 맵으로 이어지는 포탈을 우선으로 고른다.
 -- (게임 자체엔 "다음 층" 개념이 없고 맵마다 개별 포탈로만 연결돼 있어서, 방문 기록으로
 -- 뒤로가기 포탈을 피하는 방식으로 대부분의 순차 던전 구조에서 앞으로 진행하게 한다.)
+-- GetPortalLocal은 InitializedFieldPortal/InitializedPortalChunk가 true여야 assert 없이 도는데,
+-- 이 둘은 맵 에디터 도구(MeramMapEditorTool)만 호출하는 CacheFieldPortals/CachePortalChunkData가
+-- 켜준다 — 즉 정상 플레이 중엔 영원히 false로 남아 GetPortalLocal이 항상 assert로 죽는다.
+-- 두 함수 다 서버/에디터 상태와 무관하게 로컬 데이터 테이블만 읽으므로, 여기서 직접 한 번(이후엔
+-- 플래그가 true라 재실행 안 됨) 불러서 정상 플레이에서도 포탈 조회가 되게 한다.
+local function ensurePortalDataLoaded()
+  local svc = ___MOD._MeramPortalDataService
+  if not svc then return end
+  -- 맵 에디터 DrawPortals와 동일: 데이터가 비동기로 늦게 뜰 수 있어 매 프레임 재시도한다
+  -- (OnUpdate 자체가 매 프레임 호출되니 여기선 별도 wait 없이 프레임당 1회씩만 시도).
+  if not svc.InitializedFieldPortal then
+    ___MOD.pcall(function() svc:LoadFieldPortal() end)
+  end
+  if not svc.InitializedPortalChunk then
+    ___MOD.pcall(function() svc:LoadPortalChunk() end)
+  end
+end
+
 local function pickNextPortal(mapId, visitedMaps)
-  local portals = ___MOD._MeramPortalDataService and ___MOD._MeramPortalDataService:GetPortalLocal(mapId)
+  ensurePortalDataLoaded()
+  local svc = ___MOD._MeramPortalDataService
+  local portals = svc and svc.InitializedFieldPortal and svc.InitializedPortalChunk and svc:GetPortalLocal(mapId)
   if not portals or #portals == 0 then
     return nil
   end
@@ -73,6 +93,19 @@ local function isWantedItem(name)
     end
   end
   return false
+end
+
+-- 실제 습득 확인용: 클라이언트 인벤토리 슬롯을 스냅샷 떠서 줍기 시도 전/후로 비교한다
+-- (ActionGet은 서버 승인이 필요해서 호출한다고 바로 들어오는 게 보장이 안 됨 — 진짜 들어왔는지 확인용).
+local function snapshotInventory()
+  local snap = {}
+  local maxSlots = ___MOD._MeramConstValues.MaxItemInventorySlotCount
+  for i = 1, maxSlots do
+    local info = ___MOD._MeramClientInventoryService:GetSlotItemsInfo(i)
+    -- ItemName: 내부 아이템 식별 문자열(숫자 ID는 없음, 이게 제일 정확한 식별자). DisplayName은 화면표시용.
+    snap[i] = info and { name = info.ItemName, display = info.DisplayName, count = info.Count } or false
+  end
+  return snap
 end
 
 local function findNearestItem(myPos)
@@ -224,36 +257,34 @@ return function(self, delta)
   local gameHud = ___MOD._MeramHudService:GetCurrentGameHud()
   local avail = state.enabled and self:IsTargetAvailable()
 
-  ___MOD.pcall(function()
-    local localPlayer = ___MOD._UserService and ___MOD._UserService.LocalPlayer
-    if not localPlayer then
-      return
-    end
-    local playerEntity = localPlayer:GetChildByName("Player")
-    if not playerEntity then
-      return
-    end
-    local myMov = playerEntity.MeramMovementComponent
-    if not myMov then
-      return
-    end
-    local myPos = myMov.Position
-    if not myPos then
-      return
-    end
-    local controller = localPlayer.MeramPlayerController
-    if not controller then
-      return
-    end
+  dbgElapsed = dbgElapsed + (delta or 0)
+  local dbg = dbgElapsed >= 1.0
+  if dbg then dbgElapsed = 0 end
 
-    dbgElapsed = dbgElapsed + (delta or 0)
-    local dbg = dbgElapsed >= 1.0
-    if dbg then dbgElapsed = 0 end
+  -- 기능별로 pcall을 따로 둔다: 한 기능(예: 자동사냥의 포탈 탐색)에서 에러가 나도
+  -- 다른 기능(자힐/따라가기 등)까지 같이 멈추지 않게 하기 위함. 예전엔 전부 하나의
+  -- pcall에 있어서 자동사냥 에러가 따라가기까지 막는 문제가 실제로 있었다.
+  local function reportError(label, ok, err)
+    if not ok and dbg and gameHud then
+      gameHud:SystemMessage("[" .. label .. " ERROR] " .. tostring(err))
+    end
+  end
 
+  local localPlayer = ___MOD._UserService and ___MOD._UserService.LocalPlayer
+  local playerEntity = localPlayer and localPlayer:GetChildByName("Player")
+  local myMov = playerEntity and playerEntity.MeramMovementComponent
+  local myPos = myMov and myMov.Position
+  local controller = localPlayer and localPlayer.MeramPlayerController
+  if not (localPlayer and playerEntity and myMov and myPos and controller) then
+    elapsed = 0
+    return
+  end
+
+  if state.healEnabled then
     -- 자힐(HP): F2로 따라가기와 독립적으로 켜고 끈다.
     -- HP/MP는 UIMeramUserInfo.SetProp 패치가 ___MOD._G 브리지에 캐싱해둔 값을 읽는다
     -- (UI 위젯 자체엔 현재값이 저장 안 돼 있어서 직접 못 읽음).
-    if state.healEnabled then
+    local ok, err = ___MOD.pcall(function()
       local myNetObjId = playerEntity.MeramCreatureController and playerEntity.MeramCreatureController.NetObjId
       healCooldown = healCooldown - (delta or 0)
       mpHealCooldown = mpHealCooldown - (delta or 0)
@@ -262,10 +293,13 @@ return function(self, delta)
       if dbg then
         if gameHud then
           gameHud:SystemMessage("[dbg heal] hp=" .. tostring(hp) .. "/" .. tostring(maxHp)
+            .. " (기준 " .. tostring(state.hpHealPercent or (HP_SELF_HEAL_THRESHOLD * 100)) .. "%)"
             .. " mp=" .. tostring(mp) .. "/" .. tostring(maxMp) .. " netObjId=" .. tostring(myNetObjId))
         end
       end
-      if hp and maxHp and maxHp > 0 and hp / maxHp <= HP_SELF_HEAL_THRESHOLD and healCooldown <= 0 then
+      -- HP 기준(%)은 [ ] 키로 UIMeramMainHud.HandleKeyDownEvent에서 10%p씩 조절 가능(state.hpHealPercent).
+      local hpThreshold = (state.hpHealPercent or (HP_SELF_HEAL_THRESHOLD * 100)) / 100
+      if hp and maxHp and maxHp > 0 and hp / maxHp <= hpThreshold and healCooldown <= 0 then
         healCooldown = HEAL_COOLDOWN_SEC
         local spellInv = getSpellInventory(gameHud)
         if spellInv and myNetObjId then
@@ -285,13 +319,17 @@ return function(self, delta)
           gameHud:SystemMessage("[dbg heal] MP 시전 실패 spellInv=" .. tostring(spellInv) .. " netObjId=" .. tostring(myNetObjId))
         end
       end
-    end
+    end)
+    reportError("자힐", ok, err)
+  end
 
-    -- 자동줍기(F4)를 자동사냥(F3)보다 먼저 체크한다: 주울 아이템이 있으면 그쪽을 우선한다.
-    local nearItem = state.lootEnabled and findNearestItem(myPos)
+  -- 자동줍기(F4)를 자동사냥(F3)보다 먼저 체크한다: 주울 아이템이 있으면 그쪽을 우선한다.
+  local okNear, nearItem = ___MOD.pcall(function() return state.lootEnabled and findNearestItem(myPos) end)
+  if not okNear then nearItem = nil end
 
-    -- 자동사냥(F3): 자동줍기가 처리할 아이템이 없을 때만 동작한다.
-    if state.huntEnabled and not nearItem then
+  -- 자동사냥(F3): 자동줍기가 처리할 아이템이 없을 때만 동작한다.
+  if state.huntEnabled and not nearItem then
+    local ok, err = ___MOD.pcall(function()
       state.visitedMaps = state.visitedMaps or {}
       if state.visitedMaps[myMov.MapId] ~= true then
         state.visitedMaps[myMov.MapId] = true
@@ -309,7 +347,11 @@ return function(self, delta)
           local monPos = monster.MeramMovementComponent and monster.MeramMovementComponent.Position
           if monPos then
             local facingDir = directionTo(myPos, monPos)
-            if dist <= 1 or ATTACK_IS_RANGED then
+            -- 공격 사거리(-/+ 키, 1~10칸)는 UIMeramMainHud.HandleKeyDownEvent에서 state.attackRange로 조절.
+            -- 사거리 1(근접)은 정확히 1칸 거리일 때만, 그 이상은 그 거리 이내면 시전.
+            local range = state.attackRange or ATTACK_RANGE_DEFAULT
+            local inRange = (range == 1 and dist == 1) or (range > 1 and dist <= range)
+            if inRange then
               controller:ChangeDirection(facingDir)  -- 공격 전에 대상 쪽으로 방향부터 맞춘다
               local spellInv = getSpellInventory(gameHud)
               local monCC = monster.MeramCreatureController
@@ -317,15 +359,17 @@ return function(self, delta)
                 spellInv:TryServerUseSpell(ATTACK_SPELL_SLOT, monCC.NetObjId, 0, 0, 0, "")
               end
             end
-            if dist > 1 then
+            if not inRange then
+              -- 사거리 밖일 때만 접근한다(사거리 안이면 그 자리에서 계속 시전, 1칸까지 안 붙음).
               -- 이동불가 타일을 완벽히 피하도록 BFS로 다음 칸을 정한다(범위 밖/실패 시 기존 방식으로 대체).
               local path = bfsPath(myMov.MapId, myPos, monPos, PATHFIND_MAX_NODES)
               local moveDir = (path and path[1]) or facingDir
-              moveToward(myMov, myPos, controller, moveDir)  -- 원거리라도 계속 접근(줍기 등 위해)
+              moveToward(myMov, myPos, controller, moveDir)  -- 사거리 밖이면 계속 접근
             end
           end
           if dbg and gameHud then
-            gameHud:SystemMessage("[dbg hunt] target=" .. tostring(monster.Name) .. " dist=" .. tostring(dist))
+            gameHud:SystemMessage("[dbg hunt] target=" .. tostring(monster.Name) .. " dist=" .. tostring(dist)
+              .. " range=" .. tostring(state.attackRange or ATTACK_RANGE_DEFAULT))
           end
         else
           -- 몬스터가 안 보임: 바로 포기하지 않고 잠깐 더 기다렸다가(NO_MONSTER_GRACE_SEC) 포탈을 찾는다.
@@ -338,13 +382,19 @@ return function(self, delta)
               end
             end
             local portal = state.huntPortal
-            if portal then
+            if portal and not (portal.FromX and portal.FromY) then
+              -- Field 타입 포탈 등 FromX/FromY가 없는 경우: 위치를 모르니 이 포탈은 못 쓴다.
+              if dbg and gameHud then
+                gameHud:SystemMessage("[dbg hunt] 포탈 좌표 없음(Field형?) type=" .. tostring(portal.Type))
+              end
+            elseif portal then
               local portalPos = { x = portal.FromX, y = portal.FromY }
               local direction, dx, dy = directionTo(myPos, portalPos)
               if dx == 0 and dy == 0 then
                 -- 포탈 타일 위: 서버가 알아서 텔레포트한다 (별도 액션 불필요)
               else
-                moveToward(myMov, myPos, controller, direction)
+                local path = bfsPath(myMov.MapId, myPos, portalPos, PATHFIND_MAX_NODES)
+                moveToward(myMov, myPos, controller, (path and path[1]) or direction)
               end
               if dbg and gameHud then
                 gameHud:SystemMessage("[dbg hunt] 포탈로 이동 dx=" .. tostring(dx) .. " dy=" .. tostring(dy))
@@ -357,10 +407,28 @@ return function(self, delta)
           end
         end
       end
-    end
+    end)
+    reportError("자동사냥", ok, err)
+  end
 
-    -- 자동줍기(F4): 자동사냥보다 우선 처리(위에서 nearItem으로 이미 조회함).
-    if state.lootEnabled then
+  -- 자동줍기(F4): 자동사냥보다 우선 처리(위에서 nearItem으로 이미 조회함).
+  if state.lootEnabled then
+    local ok, err = ___MOD.pcall(function()
+      -- 지난 틱에 ActionGet을 호출했다면, 그 사이 실제로 인벤토리에 뭐가 들어왔는지 비교해서 확인한다.
+      if state.lootPendingCheck then
+        local after = snapshotInventory()
+        local before = state.lootPendingCheck
+        for i = 1, #after do
+          local a, b = after[i], before[i]
+          if a and (not b or a.name ~= b.name or a.count ~= b.count) then
+            if gameHud then
+              gameHud:SystemMessage("[자동줍기] 획득 확인: " .. tostring(a.display) .. " (id=" .. tostring(a.name) .. ", 수량=" .. tostring(a.count) .. ")")
+            end
+          end
+        end
+        state.lootPendingCheck = nil
+      end
+
       lootElapsed = lootElapsed + (delta or 0)
       if lootElapsed >= LOOT_INTERVAL then
         lootElapsed = lootElapsed - LOOT_INTERVAL
@@ -370,6 +438,24 @@ return function(self, delta)
           if itemPos then
             local direction, dx, dy = directionTo(myPos, itemPos)
             if dx == 0 and dy == 0 then
+              state.lootPendingCheck = snapshotInventory()  -- 서버 응답 오기 전 상태를 미리 찍어둔다
+              -- 디버그: entity.Name이 "MeramObject"로 뭉뚱그려져 있어서, 종류 구분에 쓸 만한
+              -- 다른 후보 필드들을 한 번에 찔러본다. 원인 파악 끝나면 이 블록은 지운다.
+              if gameHud then
+                local function tryField(obj, name)
+                  local ok2, v = ___MOD.pcall(function() return obj[name] end)
+                  return ok2 and tostring(v) or "err"
+                end
+                local ic = item.MeramItemContext
+                gameHud:SystemMessage("[dbg loot-id] MeramItemContext=" .. tostring(ic))
+                if ic then
+                  gameHud:SystemMessage("[dbg loot-id] ItemName=" .. tryField(ic, "ItemName")
+                    .. " DisplayName=" .. tryField(ic, "DisplayName")
+                    .. " DataId=" .. tryField(ic, "DataId"))
+                end
+                local irm = item.MeramItemRenderManager
+                gameHud:SystemMessage("[dbg loot-id] MeramItemRenderManager=" .. tostring(irm))
+              end
               controller:ActionGet(true)
               if gameHud then
                 gameHud:SystemMessage("[자동줍기] " .. tostring(item.Name) .. " 획득 시도")
@@ -380,13 +466,16 @@ return function(self, delta)
           end
         end
       end
-    end
+    end)
+    reportError("자동줍기", ok, err)
+  end
 
-    if not state.enabled then
-      elapsed = 0
-      return
-    end
+  if not state.enabled then
+    elapsed = 0
+    return
+  end
 
+  local ok, err = ___MOD.pcall(function()
     if avail then
       -- 정상 추적: 대상이 보이는 동안 마지막 위치/맵/방향을 계속 갱신해둔다.
       local target = self:GetTarget()
@@ -431,7 +520,8 @@ return function(self, delta)
       end
 
       local fallbackDir, dx, dy = directionTo(myPos, targetPos)
-      if ___MOD.math.abs(dx) + ___MOD.math.abs(dy) <= KEEP_DISTANCE then
+      local keepDistance = state.followDistance or KEEP_DISTANCE
+      if ___MOD.math.abs(dx) + ___MOD.math.abs(dy) <= keepDistance then
         return
       end
 
@@ -512,4 +602,5 @@ return function(self, delta)
       end
     end
   end)
+  reportError("따라가기", ok, err)
 end
