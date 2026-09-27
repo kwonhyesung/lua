@@ -458,7 +458,6 @@ static DWORD WINAPI watcher(LPVOID) {
     std::unordered_set<DWORD> armed;
     DWORD self = GetCurrentThreadId();
     ULONGLONG deadline = GetTickCount64() + DISCOVERY_WINDOW_MS;
-    bool loggedAllDone = false;
     for (;;) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
@@ -473,13 +472,7 @@ static DWORD WINAPI watcher(LPVOID) {
             } while (Thread32Next(snap, &te));
             CloseHandle(snap);
         }
-        // 규칙이 다 매칭돼도 바로 disarm하지 않는다 — 채널변경으로 같은 이름의 청크가
-        // 다시 로드되는 경우까지 잡으려고, 이미 안전 검증된 DISCOVERY_WINDOW_MS 전체를 계속 무장 상태로 채운다.
-        // process()는 이름만 맞으면 몇 번이든 재치환하므로 별도 재적용 로직 없이 이것만으로 충분하다.
-        if (!loggedAllDone && all_rules_done()) {
-            logf("dormant: all %zu rule(s) confirmed (armed 유지, 채널변경 재로드 대비)", g_totalWholeRules);
-            loggedAllDone = true;
-        }
+        if (all_rules_done()) { logf("dormant: all %zu rule(s) confirmed", g_totalWholeRules); break; }
         if (GetTickCount64() >= deadline) { logf("dormant: %lums window expired", DISCOVERY_WINDOW_MS); break; }
         Sleep(250);
     }

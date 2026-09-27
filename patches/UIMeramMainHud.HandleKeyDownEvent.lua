@@ -48,6 +48,13 @@ return function(self, event)
     if gameHud then
       gameHud:SystemMessage(state.lootEnabled and "[자동줍기] ON" or "[자동줍기] OFF")
     end
+  elseif event.key == ___MOD.KeyboardKey.KeypadMultiply then
+    local state = getState()
+    state.debuffEnabled = not state.debuffEnabled
+    local gameHud = ___MOD._MeramHudService:GetCurrentGameHud()
+    if gameHud then
+      gameHud:SystemMessage(state.debuffEnabled and "[디버프] ON" or "[디버프] OFF")
+    end
   elseif event.key == ___MOD.KeyboardKey.LeftBracket or event.key == ___MOD.KeyboardKey.RightBracket then
     local state = getState()
     local pct = state.hpHealPercent or 30  -- 기본값(HP_SELF_HEAL_THRESHOLD)과 맞춤

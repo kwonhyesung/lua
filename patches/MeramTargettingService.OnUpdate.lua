@@ -4,11 +4,11 @@
 -- 마지막으로 이동하던 방향으로 몇 칸 더 가보고 그래도 못 찾으면 정지한다.
 -- On/Off 상태는 UIMeramMainHud.HandleKeyDownEvent(F1)와 ___MOD._G.__LuahookFollow로 공유한다
 -- (서로 다른 청크라 self로 상태 공유 불가 → Lua 전역 테이블을 브리지로 사용).
-local MOVE_INTERVAL = 0.2  -- 1초 5틱
+local MOVE_INTERVAL = 0.5  -- 1초 2틱
 local KEEP_DISTANCE = 2  -- 대상과 유지할 최소 거리(맨해튼)
 local SEARCH_EXTRA_STEPS = 2  -- 마지막 좌표 도착 후 마지막 방향으로 더 가볼 칸 수
 local MAP_MATCH_GRACE_SEC = 5  -- 맵 전환(포탈) 중 내 MapId 갱신을 기다려주는 유예 시간
-local PATHFIND_MAX_NODES = 200  -- BFS 탐색 범위(칸 수). 벗어나면 기존 방향 추정 방식으로 대체
+local PATHFIND_MAX_NODES = 100  -- BFS 탐색 범위(칸 수). 벗어나면 기존 방향 추정 방식으로 대체
 local elapsed = 0
 
 -- 자힐(HP/MP) + 따라가기 대상 회복
@@ -33,6 +33,12 @@ local HUNT_INTERVAL = 0.2  -- 1초 5틱
 local huntElapsed = 0
 local NO_MONSTER_GRACE_SEC = 2  -- 몬스터가 없다고 바로 판단하지 않고 이만큼 기다려본다
 local noMonsterElapsed = 0
+
+-- 몬스터 디버프(숫자패드 '*'): 사거리 안의 모든 몬스터에게 한 번씩만 시전. 따라가기/이동과 무관하게 독립 동작.
+local DEBUFF_SPELL_SLOT = 6
+local DEBUFF_RANGE = 8
+local DEBUFF_INTERVAL = 0.2  -- 1초 5틱, 틱당 한 마리씩만 시전
+local debuffElapsed = 0
 
 -- 몬스터가 없을 때 다음 맵으로: 안 가본 맵으로 이어지는 포탈을 우선으로 고른다.
 -- (게임 자체엔 "다음 층" 개념이 없고 맵마다 개별 포탈로만 연결돼 있어서, 방문 기록으로
@@ -154,6 +160,31 @@ local function findNearestMonster(myPos)
     end
   end
   return nearest, nearestDist
+end
+
+-- 디버프용: 사거리 안에서 아직 안 걸린(debuffed 테이블에 없는) 몬스터 하나를 찾는다.
+local function findNextUndebuffedMonster(myPos, debuffed, maxRange)
+  local seen = ___MOD._MeramCreatureService and ___MOD._MeramCreatureService.SeenObjectsClientOnly
+  if not seen then
+    return nil
+  end
+  for _, entity in ___MOD.pairs(seen) do
+    if ___MOD.isvalid(entity) then
+      local cc = entity.MeramCreatureController
+      if cc and cc.TypeKey == ___MOD._MeramObjectKey.Monster and not cc:IsPendingKill()
+          and cc.NetObjId and not debuffed[cc.NetObjId] then
+        local mov = entity.MeramMovementComponent
+        local pos = mov and mov.Position
+        if pos then
+          local dist = ___MOD.math.abs(pos.x - myPos.x) + ___MOD.math.abs(pos.y - myPos.y)
+          if dist <= maxRange then
+            return entity, cc.NetObjId
+          end
+        end
+      end
+    end
+  end
+  return nil
 end
 
 local function getSpellInventory(gameHud)
@@ -409,6 +440,35 @@ return function(self, delta)
       end
     end)
     reportError("자동사냥", ok, err)
+  end
+
+  -- 몬스터 디버프(숫자패드 '*'): 따라가기/자동사냥과 무관하게 독립 동작, 사거리 안 몬스터에 한 번씩만 시전.
+  -- 이미 시전한 몬스터는 state.debuffed에 영구 기록(맵 전환 시 초기화)해서 중복 시전을 안 한다.
+  if state.debuffEnabled then
+    local ok, err = ___MOD.pcall(function()
+      state.debuffed = state.debuffed or {}
+      if state.debuffMapId ~= myMov.MapId then
+        state.debuffMapId = myMov.MapId
+        state.debuffed = {}  -- 맵 전환: 새 맵 몬스터는 전부 미시전 취급
+      end
+
+      debuffElapsed = debuffElapsed + (delta or 0)
+      if debuffElapsed >= DEBUFF_INTERVAL then
+        debuffElapsed = debuffElapsed - DEBUFF_INTERVAL
+        local monster, netObjId = findNextUndebuffedMonster(myPos, state.debuffed, DEBUFF_RANGE)
+        if monster and netObjId then
+          local spellInv = getSpellInventory(gameHud)
+          if spellInv then
+            spellInv:TryServerUseSpell(DEBUFF_SPELL_SLOT, netObjId, 0, 0, 0, "")
+            state.debuffed[netObjId] = true
+            if dbg and gameHud then
+              gameHud:SystemMessage("[디버프] " .. tostring(monster.Name) .. " 시전")
+            end
+          end
+        end
+      end
+    end)
+    reportError("디버프", ok, err)
   end
 
   -- 자동줍기(F4): 자동사냥보다 우선 처리(위에서 nearItem으로 이미 조회함).

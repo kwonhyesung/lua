@@ -38,6 +38,30 @@ static void ilog(const wchar_t* fmt, ...) {
     fclose(f);
 }
 
+// 예전 실행들이 %TEMP%에 남긴 "8자리hex.dll"(+ .dir 마커) 잔해를 지운다. 게임에 아직 로드된
+// 최신 것은 공유 위반으로 삭제가 실패하는데, 그건 무시하고 넘어간다(다음 실행 때 다시 시도됨).
+static void cleanup_old_temp_dlls() {
+    wchar_t tmpdir[MAX_PATH]; GetTempPathW(MAX_PATH, tmpdir);
+    std::wstring pattern = std::wstring(tmpdir) + L"????????.dll";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::wstring name = fd.cFileName;
+        bool isHex8 = name.size() == 12; // "xxxxxxxx.dll"
+        for (int i = 0; isHex8 && i < 8; ++i) {
+            wchar_t c = name[i];
+            isHex8 = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f');
+        }
+        if (isHex8) {
+            std::wstring full = std::wstring(tmpdir) + name;
+            DeleteFileW(full.c_str());
+            DeleteFileW((full + L".dir").c_str());
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
 // hook.dll을 %TEMP%에 랜덤 이름으로 복사하고, 원본 폴더를 적은 .dir 마커를 같이 남긴 뒤
 // pid에 LoadLibraryW 원격 스레드로 주입한다. 실패해도 false만 반환하고 종료하지 않는다
 // (Insert 재주입 루프에서 한 번 실패했다고 프로그램 전체가 죽으면 안 되므로).
@@ -115,6 +139,7 @@ int wmain(int argc, wchar_t** argv) {
     // 채널이동 등으로 게임이 Lua를 재로드하면 이전에 넣은 패치가 날아간다. 그때마다 이 창을
     // 다시 실행할 필요 없이, Insert 키를 누르면 같은 프로세스에 재주입한다(원본 제작자도 이 방식).
     wprintf(L"%s 대기 중... (게임을 실행하세요)\n", exe);
+    cleanup_old_temp_dlls();
     GetAsyncKeyState(VK_INSERT); // 시작 전에 눌려있던 상태를 흘려보내 첫 루프에서 오탐하지 않게 한다
     for (;;) {
         DWORD pid;
